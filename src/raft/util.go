@@ -45,3 +45,10 @@ func resetTimer(timer *time.Timer, d time.Duration) {
 	}
 	timer.Reset(d)
 }
+
+func max(x, y int) int {
+	if x > y {
+		return x
+	}
+	return y
+}
