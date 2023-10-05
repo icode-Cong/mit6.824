@@ -20,11 +20,13 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -207,6 +209,7 @@ func (rf *Raft) startElection() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	var voteCnt int32 = 1
+	rf.persist()
 
 	// 然后构造请求，不能在启动的协程内构造，因为返回后，锁会被释放，状态可能会变
 	args := &RequestVoteArgs{
@@ -243,7 +246,7 @@ func (rf *Raft) startElection() {
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 							rf.becomeFollower()
-
+							rf.persist()
 						}
 					}
 				}
@@ -271,6 +274,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		rf.becomeFollower()
 		rf.currentTerm = args.Term
+		rf.persist()
 
 		// 增加考虑日志的选举，选举限制
 		if args.LastLogTerm < rf.getLastLog().Term || (args.LastLogTerm == rf.getLastLog().Term && args.LastLogIndex < rf.getLastLog().Index) {
@@ -285,6 +289,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 如果 args.Term 不大于当前节点的任期，则不同意投票，告知对方自己的任期
 		DPrintf("[Info] {Node %v} 当前任期为 %v, 拒绝向 {Node %v} 投票", rf.me, rf.currentTerm, args.CandidateId)
 		reply.Term = rf.currentTerm
+		rf.persist()
 		reply.VoteGranted = false
 	}
 }
@@ -356,6 +361,7 @@ func (rf *Raft) broadcastHeartbeat() {
 						rf.heartbeatTimer.Stop()
 						resetTimer(rf.electionTimer, randomizedElectionTimeout())
 						rf.currentTerm = reply.Term
+						rf.persist()
 					} else {
 						// 正常响应
 						if reply.Success {
@@ -434,6 +440,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if unmatchIndex != -1 {
 				rf.logs = rf.logs[:args.Logs[unmatchIndex].Index-rf.getFirstLog().Index]
 				rf.logs = append(rf.logs, args.Logs[unmatchIndex:]...)
+				rf.persist()
 			}
 			// 全都匹配，这是延迟到达的请求，不予理会
 			reply.Success = true
@@ -467,6 +474,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		resetTimer(rf.electionTimer, randomizedElectionTimeout())
 	} else {
 		reply.Term = rf.currentTerm
+		rf.persist()
 		reply.Success = false
 	}
 }
@@ -496,60 +504,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-// 日志系列工具方法，注意该类工具方法全都不加锁，调用时需考虑到这个问题
-func (rf *Raft) getFirstLog() Entry {
-	return rf.logs[0]
-}
-
-func (rf *Raft) getLastLog() Entry {
-	return rf.logs[len(rf.logs)-1]
-}
-
-func (rf *Raft) appendLog(command interface{}) Entry {
-	newLog := Entry{
-		Index:   rf.getLastLog().Index + 1,
-		Term:    rf.currentTerm,
-		Command: command,
-	}
-	rf.logs = append(rf.logs, newLog)
-	return newLog
-}
-
-func (rf *Raft) cloneLogs(index int) []Entry {
-	// DPrintf("[Info] {Node %v} 克隆日志: 入参 {index = %v}, 中间变量{rf.lastLogIndex = %v, rf.logs = %v}", rf.me, index, rf.getLastLog().Index, getDebugEntry(rf.logs))
-	temp := make([]Entry, rf.getLastLog().Index-index+1)
-	copy(temp, rf.logs[index-rf.getFirstLog().Index:])
-	// DPrintf("[Info] {Node %v} 克隆日志: 入参 {index = %v}, 中间变量{len(temp) = %v, rf.logs = %v}, 出参{temp = %v}", rf.me, index, rf.getLastLog().Index-index+1, rf.logs[index-rf.getFirstLog().Index:], temp)
-	return temp
-}
-
-func getDebugEntry(logs []Entry) []debugEntry {
-	debuges := []debugEntry{}
-	for _, e := range logs {
-		debuges = append(debuges, debugEntry{
-			Term:  e.Term,
-			Index: e.Index,
-		})
-	}
-	return debuges
-}
-
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-// before you've implemented snapshots, you should pass nil as the
-// second argument to persister.Save().
-// after you've implemented snapshots, pass the current snapshot
-// (or nil if there's not yet a snapshot).
+// 保存持久化状态用于崩溃恢复
+// 没有快照时，persister.Save() 第二个参数为 nil
+// 首先考虑极端情况，所有节点都崩溃，重新恢复
+// 1. 必须有日志；如果部分节点已经提交了一些日志，但部分节点没提交这部分日志，重启后他们也没机会提交这部分日志，日志从1开始，任期从1开始，会导致提交日志不一致
+// 2. 只保存日志，会重新选举，日志从1开始，任期从1开始，选举限制就失效了，需要保存 currentTerm
+// 3. commitIndex 和 lastApplied 需要持久化吗？重启后，两者都为0/快照，不会引起提交，待新的 leader 选出后，会由新的 leader 去推断 commitIndex
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.logs)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -559,17 +528,16 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var logs []Entry
+	if d.Decode(&currentTerm) != nil || d.Decode(&logs) != nil {
+		DPrintf("[Error] {Node %v} 读取持久化状态失败", rf.me)
+	} else {
+		rf.currentTerm = currentTerm
+		rf.logs = logs
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -623,4 +591,43 @@ func (rf *Raft) GetState() (int, bool) {
 	isleader = (rf.state == StateLeader)
 	term = rf.currentTerm
 	return term, isleader
+}
+
+// 日志系列工具方法，注意该类工具方法全都不加锁，调用时需考虑到这个问题
+func (rf *Raft) getFirstLog() Entry {
+	return rf.logs[0]
+}
+
+func (rf *Raft) getLastLog() Entry {
+	return rf.logs[len(rf.logs)-1]
+}
+
+func (rf *Raft) appendLog(command interface{}) Entry {
+	newLog := Entry{
+		Index:   rf.getLastLog().Index + 1,
+		Term:    rf.currentTerm,
+		Command: command,
+	}
+	rf.logs = append(rf.logs, newLog)
+	rf.persist()
+	return newLog
+}
+
+func (rf *Raft) cloneLogs(index int) []Entry {
+	// DPrintf("[Info] {Node %v} 克隆日志: 入参 {index = %v}, 中间变量{rf.lastLogIndex = %v, rf.logs = %v}", rf.me, index, rf.getLastLog().Index, getDebugEntry(rf.logs))
+	temp := make([]Entry, rf.getLastLog().Index-index+1)
+	copy(temp, rf.logs[index-rf.getFirstLog().Index:])
+	// DPrintf("[Info] {Node %v} 克隆日志: 入参 {index = %v}, 中间变量{len(temp) = %v, rf.logs = %v}, 出参{temp = %v}", rf.me, index, rf.getLastLog().Index-index+1, rf.logs[index-rf.getFirstLog().Index:], temp)
+	return temp
+}
+
+func getDebugEntry(logs []Entry) []debugEntry {
+	debuges := []debugEntry{}
+	for _, e := range logs {
+		debuges = append(debuges, debugEntry{
+			Term:  e.Term,
+			Index: e.Index,
+		})
+	}
+	return debuges
 }
